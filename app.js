@@ -43,10 +43,12 @@ async function startServer() {
     const authRoute = require("./routes/authRoutes");
     const userRoute = require("./routes/userRoutes");
     const licenseRoute = require("./routes/licenseRoutes");
+    const licenseDocumentRoutes = require("./routes/licenseDocumentRoutes");
 
     app.use("/api/auth", authRoute);
     app.use("/api/users", userRoute);
     app.use("/api/licenses", licenseRoute);
+    app.use("/api/license-documents", licenseDocumentRoutes);
     app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
     app.listen(PORT, () => {

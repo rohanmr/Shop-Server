@@ -8,6 +8,7 @@ const {
   renewLicense,
   updateLicense,
   deleteLicense,
+  retryProvisioning,
 } = require("../controllers/licenseController");
 const { authToken, authRoles } = require("../middleware/auth");
 

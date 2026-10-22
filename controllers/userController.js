@@ -1,23 +1,42 @@
-const User = require("../models/User");
-const License = require("../models/License");
-
+const getTenantConnection = require("../config/tenantDb").getTenantConnection;
 const bcrypt = require("bcrypt");
+const License = require("../models/License");
+const User = require("../models/User");
 
 const createShopAdmin = async (req, res) => {
-  const { name, email, password, role, mobile, licenseCode, address } =
-    req.body;
+  const { name, email, password, mobile, licenseCode, address } = req.body;
 
-  if (!name || !email || !password || !role || !mobile) {
-    return res
-      .status(400)
-      .json({ message: "All registration parameters are required." });
+  // 1. Validate required fields
+  if (!name || !email || !password || !mobile || !licenseCode) {
+    return res.status(400).json({
+      success: false,
+      message: "Name, email, password, mobile, and license code are required.",
+    });
   }
 
   try {
-    // Prevent duplicate account registrations
+    const normalizedName = name.trim();
     const normalizedEmail = email.trim().toLowerCase();
+    const normalizedLicenseCode = licenseCode.trim().toUpperCase();
+
     const normalizedMobile =
-      typeof mobile === "string" ? mobile.trim().replace(/[\s()-]/g, "") : "";
+      typeof mobile === "string"
+        ? mobile.trim().replace(/[\s()-]/g, "")
+        : String(mobile).trim();
+
+    if (!normalizedName) {
+      return res.status(400).json({
+        success: false,
+        message: "Name is required.",
+      });
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a valid email address.",
+      });
+    }
 
     if (!/^\+?[0-9]{7,15}$/.test(normalizedMobile)) {
       return res.status(400).json({
@@ -26,92 +45,161 @@ const createShopAdmin = async (req, res) => {
       });
     }
 
-    const userExists = await User.findOne({
+    if (password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must contain at least 8 characters.",
+      });
+    }
+
+    // 2. Find the license in the master database
+    const license = await License.findOne({
+      code: normalizedLicenseCode,
+    });
+
+    if (!license) {
+      return res.status(404).json({
+        success: false,
+        message: "License not found. Please check the license code.",
+      });
+    }
+
+    // 3. Validate license status
+    if (license.status !== "active") {
+      return res.status(403).json({
+        success: false,
+        message: `This license is ${license.status} and cannot be assigned.`,
+      });
+    }
+
+    if (
+      !license.expiresAt ||
+      new Date(license.expiresAt).getTime() <= Date.now()
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "This license has expired.",
+      });
+    }
+
+    if (
+      license.startDate &&
+      new Date(license.startDate).getTime() > Date.now()
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "This license is not active yet.",
+      });
+    }
+
+    // 4. Ensure tenant provisioning has completed
+    if (
+      license.databaseProvisioningStatus !== "ready" ||
+      !license.tenantDbName ||
+      !license.tenantId
+    ) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "Tenant database is not ready. Please retry provisioning first.",
+        databaseProvisioningStatus: license.databaseProvisioningStatus,
+      });
+    }
+
+    // 5. Connect to this license's tenant database
+    const tenantContext = await getTenantConnection(license.tenantDbName);
+    const TenantUser = tenantContext.User;
+
+    // 6. Check whether this email already exists in this tenant
+    const existingUser = await TenantUser.findOne({
       email: normalizedEmail,
     });
 
-    if (userExists) {
-      return res.status(400).json({
-        message: "A user with this email already exists.",
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        message: "A user with this email already exists in this tenant.",
       });
     }
 
-    let assignedLicenseId = null;
+    // 7. Only one Shop Admin per license for this implementation
+    const existingShopAdmin = await TenantUser.findOne({
+      licenseId: license._id,
+      role: "shop_admin",
+    });
 
-    // Validation rule enforcement for Shop Admins
-    if (role === "shop_admin") {
-      if (!licenseCode || !licenseCode.trim()) {
-        return res.status(400).json({
-          success: false,
-          message: "A valid license key is required to create a Shop Admin.",
-        });
-      }
-
-      const normalizedLicenseCode = licenseCode.trim();
-
-      // Check if license is active and valid
-      const targetLicense = await License.findOne({
-        code: normalizedLicenseCode,
+    if (existingShopAdmin) {
+      return res.status(409).json({
+        success: false,
+        message: "This license is already assigned to a Shop Admin.",
       });
+    }
 
-      if (!targetLicense) {
-        return res.status(404).json({
-          message: "The provided license code was not found pls create.",
-        });
-      }
-      if (targetLicense.status !== "active") {
+    // 8. Check the license's user limit, if configured
+    if (Number.isFinite(license.maxUsers) && license.maxUsers > 0) {
+      const currentUserCount = await TenantUser.countDocuments();
+
+      if (currentUserCount >= license.maxUsers) {
         return res.status(403).json({
           success: false,
-          message: `This license is ${targetLicense.status} and cannot be assigned.`,
+          message: "This license has reached its maximum user limit.",
         });
       }
-
-      //Check whether license is already assigned
-      const existingLicenseUser = await User.findOne({
-        licenseId: targetLicense._id,
-        role: "shop_admin",
-      });
-
-      if (existingLicenseUser) {
-        return res.status(409).json({
-          success: false,
-          message:
-            "This license code is already assigned to another Shop Admin.",
-        });
-      }
-
-      assignedLicenseId = targetLicense._id;
     }
 
-    // Securely hash the plain-text password using strong salting guidelines
-    const saltRounds = 12;
-    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    // 9. Hash the password
+    const hashedPassword = await bcrypt.hash(password, 12);
 
-    // Commit record to MongoDB
-    const newUser = await User.create({
-      name: name.trim(),
+    // 10. Create the Shop Admin in the tenant database
+    const shopAdmin = await TenantUser.create({
+      name: normalizedName,
       email: normalizedEmail,
-      mobile: normalizedMobile,
       password: hashedPassword,
-      role,
-      licenseId: assignedLicenseId,
+      mobile: normalizedMobile,
+      role: "shop_admin",
+      licenseId: license._id,
       address: {
-        street: address?.street?.trim() || "",
-        city: address?.city?.trim() || "",
-        state: address?.state?.trim() || "",
-        pincode: address?.pincode?.trim() || "",
-        country: address?.country?.trim() || "India",
+        street:
+          typeof address?.street === "string" ? address.street.trim() : "",
+        city: typeof address?.city === "string" ? address.city.trim() : "",
+        state: typeof address?.state === "string" ? address.state.trim() : "",
+        pincode:
+          typeof address?.pincode === "string" ? address.pincode.trim() : "",
+        country:
+          typeof address?.country === "string" && address.country.trim()
+            ? address.country.trim()
+            : "India",
       },
     });
 
+    // 11. Return safe response fields only
     return res.status(201).json({
-      message: "Shop Admin created successfully.",
       success: true,
+      message: "Shop Admin created successfully in the tenant database.",
+      user: {
+        id: shopAdmin._id,
+        name: shopAdmin.name,
+        email: shopAdmin.email,
+        mobile: shopAdmin.mobile,
+        role: shopAdmin.role,
+        tenantId: license.tenantId,
+        licenseId: license._id,
+        licenseCode: license.code,
+      },
     });
   } catch (error) {
+    console.error("Create Shop Admin error:", error);
+
+    if (error.code === 11000) {
+      return res.status(409).json({
+        success: false,
+        message: "A user with the same unique value already exists.",
+      });
+    }
+
     return res.status(500).json({
-      message: "An error occurred while creating the user.",
-      error: error.message,
+      success: false,
+      message: "Unable to create Shop Admin.",
     });
   }
 };
@@ -171,7 +259,7 @@ const getAllShopAdmins = async (req, res) => {
   try {
     const { search, status, page = 1, limit = 10 } = req.query;
 
-    // Pagination validation
+    // 1. Validate pagination
     const currentPage = Number(page);
     const perPage = Number(limit);
 
@@ -188,18 +276,9 @@ const getAllShopAdmins = async (req, res) => {
       });
     }
 
-    // Filter shop admins
-    const filter = { role: "shop_admin" };
+    // 2. Find licenses in the master database
+    const licenseFilter = {};
 
-    // Search by name or email
-    if (search && search.trim()) {
-      filter.$or = [
-        { name: { $regex: search.trim(), $options: "i" } },
-        { email: { $regex: search.trim(), $options: "i" } },
-      ];
-    }
-
-    // Filter by license status
     if (status) {
       if (!["active", "suspended", "expired"].includes(status)) {
         return res.status(400).json({
@@ -208,36 +287,110 @@ const getAllShopAdmins = async (req, res) => {
         });
       }
 
-      const licenses = await License.find({ status }).select("_id");
-      filter.licenseId = { $in: licenses.map((license) => license._id) };
+      licenseFilter.status = status;
     }
 
+    // Only licenses with successfully provisioned tenant DBs
+    licenseFilter.databaseProvisioningStatus = "ready";
+    licenseFilter.tenantDbName = { $exists: true, $ne: "" };
+
+    const licenses = await License.find(licenseFilter)
+      .select(
+        "_id code shopName status expiresAt tenantId tenantDbName maxUsers",
+      )
+      .lean();
+
+    if (licenses.length === 0) {
+      return res.status(200).json({
+        success: true,
+        count: 0,
+        total: 0,
+        currentPage,
+        totalPages: 0,
+        shopAdmins: [],
+      });
+    }
+
+    // 3. Fetch Shop Admins from each tenant database
+    const results = await Promise.all(
+      licenses.map(async (license) => {
+        try {
+          const tenantContext = await getTenantConnection(license.tenantDbName);
+
+          const TenantUser = tenantContext.User;
+
+          const filter = {
+            role: "shop_admin",
+            licenseId: license._id,
+          };
+
+          if (search && search.trim()) {
+            const escapedSearch = search
+              .trim()
+              .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+            filter.$or = [
+              { name: { $regex: escapedSearch, $options: "i" } },
+              { email: { $regex: escapedSearch, $options: "i" } },
+            ];
+          }
+
+          const admins = await TenantUser.find(filter)
+            .select("-password")
+            .lean();
+
+          return admins.map((admin) => ({
+            ...admin,
+            licenseId: {
+              _id: license._id,
+              code: license.code,
+              shopName: license.shopName,
+              status: license.status,
+              expiresAt: license.expiresAt,
+            },
+            tenantId: license.tenantId,
+          }));
+        } catch (error) {
+          console.error(
+            `Failed to fetch Shop Admins from ${license.tenantDbName}:`,
+            error.message,
+          );
+
+          throw error;
+        }
+      }),
+    );
+
+    // 4. Combine all tenant results
+    const shopAdmins = results.flat();
+
+    // 5. Sort newest first
+    shopAdmins.sort(
+      (a, b) =>
+        new Date(b.createdAt || 0).getTime() -
+        new Date(a.createdAt || 0).getTime(),
+    );
+
+    // 6. Apply pagination after combining results
+    const total = shopAdmins.length;
     const skip = (currentPage - 1) * perPage;
 
-    const [shopAdmins, total] = await Promise.all([
-      User.find(filter)
-        .select("-password")
-        .populate("licenseId", "code shopName status expiresAt")
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(perPage),
-
-      User.countDocuments(filter),
-    ]);
+    const paginatedAdmins = shopAdmins.slice(skip, skip + perPage);
 
     return res.status(200).json({
       success: true,
-      count: shopAdmins.length,
+      count: paginatedAdmins.length,
       total,
       currentPage,
       totalPages: Math.ceil(total / perPage),
-      shopAdmins,
+      shopAdmins: paginatedAdmins,
     });
   } catch (error) {
+    console.error("Get All Shop Admins error:", error);
+
     return res.status(500).json({
       success: false,
-      message: "Failed to fetch shop admins.",
-      error: error.message,
+      message: "Failed to fetch Shop Admins from tenant databases.",
     });
   }
 };
@@ -246,25 +399,55 @@ const getShopAdminById = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const shopAdmin = await User.findOne({
-      _id: id,
-      role: "shop_admin",
+    // Find the license records that have ready tenant databases
+    const licenses = await License.find({
+      databaseProvisioningStatus: "ready",
+      tenantDbName: { $exists: true, $ne: "" },
     })
-      .select("-password")
-      .populate("licenseId", "code shopName status expiresAt")
+      .select(
+        "_id code shopName status startDate expiresAt tenantId tenantCode tenantDbName databaseProvisioningStatus",
+      )
       .lean();
 
-    if (!shopAdmin) {
-      return res.status(404).json({
-        success: false,
-        message: "Shop Admin not found.",
-      });
+    // Search for the user in each tenant database
+    for (const license of licenses) {
+      const tenantContext = await getTenantConnection(license.tenantDbName);
+
+      const TenantUser = tenantContext.User;
+
+      const shopAdmin = await TenantUser.findOne({
+        _id: id,
+        role: "shop_admin",
+        licenseId: license._id,
+      })
+        .select("-password")
+        .lean();
+
+      if (shopAdmin) {
+        return res.status(200).json({
+          success: true,
+          message: "Shop Admin fetched successfully.",
+          shopAdmin: {
+            ...shopAdmin,
+            licenseId: {
+              _id: license._id,
+              code: license.code,
+              shopName: license.shopName,
+              status: license.status,
+              startDate: license.startDate,
+              expiresAt: license.expiresAt,
+              tenantCode: license.tenantCode,
+              databaseProvisioningStatus: license.databaseProvisioningStatus,
+            },
+            tenantId: license.tenantId,
+          },
+        });
+      }
     }
 
-    return res.status(200).json({
-      success: true,
-      message: "Shop Admin fetched successfully.",
-      shopAdmin,
+    return res.status(404).json({
+      success: false,
+      message: "Shop Admin not found in any ready tenant database.",
     });
   } catch (error) {
     console.error("Get Shop Admin error:", error);
@@ -281,21 +464,49 @@ const updateShopAdmin = async (req, res) => {
     const { id } = req.params;
     const { name, email, mobile, address } = req.body;
 
-    const shopAdmin = await User.findOne({
-      _id: id,
-      role: "shop_admin",
-    }).select("_id");
+    // 2. Find ready tenant databases
+    const licenses = await License.find({
+      databaseProvisioningStatus: "ready",
+      tenantDbName: { $exists: true, $ne: "" },
+    })
+      .select("_id code shopName status expiresAt tenantId tenantDbName")
+      .lean();
 
-    if (!shopAdmin) {
+    let matchedTenant = null;
+    let shopAdmin = null;
+
+    // 3. Find the Shop Admin in tenant databases
+    for (const license of licenses) {
+      const tenantContext = await getTenantConnection(license.tenantDbName);
+
+      const TenantUser = tenantContext.User;
+
+      const foundUser = await TenantUser.findOne({
+        _id: id,
+        role: "shop_admin",
+        licenseId: license._id,
+      }).select("_id");
+
+      if (foundUser) {
+        matchedTenant = license;
+        shopAdmin = foundUser;
+        break;
+      }
+    }
+
+    if (!shopAdmin || !matchedTenant) {
       return res.status(404).json({
         success: false,
-        message: "Shop Admin not found.",
+        message: "Shop Admin not found in any ready tenant database.",
       });
     }
 
+    const tenantContext = await getTenantConnection(matchedTenant.tenantDbName);
+    const TenantUser = tenantContext.User;
+
+    // 4. Validate and prepare updates
     const updates = {};
 
-    // Update name
     if (name !== undefined) {
       if (typeof name !== "string") {
         return res.status(400).json({
@@ -316,7 +527,6 @@ const updateShopAdmin = async (req, res) => {
       updates.name = cleanName;
     }
 
-    // Update email
     if (email !== undefined) {
       if (typeof email !== "string") {
         return res.status(400).json({
@@ -326,16 +536,18 @@ const updateShopAdmin = async (req, res) => {
       }
 
       const normalizedEmail = email.trim().toLowerCase();
-      const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-      if (normalizedEmail.length > 254 || !emailPattern.test(normalizedEmail)) {
+      if (
+        normalizedEmail.length > 254 ||
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)
+      ) {
         return res.status(400).json({
           success: false,
           message: "Please provide a valid email address.",
         });
       }
 
-      const existingUser = await User.findOne({
+      const existingUser = await TenantUser.findOne({
         email: normalizedEmail,
         _id: { $ne: id },
       }).select("_id");
@@ -343,14 +555,13 @@ const updateShopAdmin = async (req, res) => {
       if (existingUser) {
         return res.status(409).json({
           success: false,
-          message: "This email is already registered.",
+          message: "This email is already registered in this tenant.",
         });
       }
 
       updates.email = normalizedEmail;
     }
 
-    // Update mobile number
     if (mobile !== undefined) {
       if (typeof mobile !== "string") {
         return res.status(400).json({
@@ -371,7 +582,6 @@ const updateShopAdmin = async (req, res) => {
       updates.mobile = cleanMobile;
     }
 
-    // Update address fields
     if (address !== undefined) {
       if (!address || typeof address !== "object" || Array.isArray(address)) {
         return res.status(400).json({
@@ -382,7 +592,8 @@ const updateShopAdmin = async (req, res) => {
 
       const allowedFields = ["street", "city", "state", "pincode", "country"];
 
-      const currentAddress = await User.findById(id).select("address");
+      const currentAddress = await TenantUser.findById(id).select("address");
+
       const updatedAddress = {
         street: currentAddress?.address?.street || "",
         city: currentAddress?.address?.city || "",
@@ -407,10 +618,20 @@ const updateShopAdmin = async (req, res) => {
       updates.address = updatedAddress;
     }
 
-    const updatedShopAdmin = await User.findOneAndUpdate(
+    // 5. Do not run an empty update
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide at least one field to update.",
+      });
+    }
+
+    // 6. Update in the matched tenant database
+    const updatedShopAdmin = await TenantUser.findOneAndUpdate(
       {
         _id: id,
         role: "shop_admin",
+        licenseId: matchedTenant._id,
       },
       {
         $set: updates,
@@ -419,7 +640,9 @@ const updateShopAdmin = async (req, res) => {
         new: true,
         runValidators: true,
       },
-    ).select("_id name email mobile address role licenseId createdAt");
+    ).select(
+      "_id name email mobile address role licenseId createdAt updatedAt",
+    );
 
     if (!updatedShopAdmin) {
       return res.status(404).json({
@@ -431,17 +654,27 @@ const updateShopAdmin = async (req, res) => {
     return res.status(200).json({
       success: true,
       message: "Shop Admin updated successfully.",
-      shopAdmin: updatedShopAdmin,
+      shopAdmin: {
+        ...updatedShopAdmin.toObject(),
+        licenseId: {
+          _id: matchedTenant._id,
+          code: matchedTenant.code,
+          shopName: matchedTenant.shopName,
+          status: matchedTenant.status,
+          expiresAt: matchedTenant.expiresAt,
+        },
+        tenantId: matchedTenant.tenantId,
+      },
     });
   } catch (error) {
+    console.error("Update Shop Admin error:", error);
+
     if (error.code === 11000) {
       return res.status(409).json({
         success: false,
-        message: "This email is already registered.",
+        message: "This email is already registered in this tenant.",
       });
     }
-
-    console.error("Update Shop Admin error:", error);
 
     return res.status(500).json({
       success: false,
@@ -454,22 +687,45 @@ const deleteShopAdmin = async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Delete only the user whose role is shop_admin.
-    const deletedAdmin = await User.findOneAndDelete({
-      _id: id,
-      role: "shop_admin",
-    }).select("_id name email role licenseId");
+    // 2. Find all ready tenant databases
+    const licenses = await License.find({
+      databaseProvisioningStatus: "ready",
+      tenantDbName: { $exists: true, $ne: "" },
+    })
+      .select("_id tenantDbName")
+      .lean();
 
-    if (!deletedAdmin) {
-      return res.status(404).json({
-        success: false,
-        message: "Shop Admin not found.",
-      });
+    // 3. Search and delete from the matching tenant DB
+    for (const license of licenses) {
+      const tenantContext = await getTenantConnection(license.tenantDbName);
+
+      const TenantUser = tenantContext.User;
+
+      const deletedAdmin = await TenantUser.findOneAndDelete({
+        _id: id,
+        role: "shop_admin",
+        licenseId: license._id,
+      }).select("_id name email role licenseId");
+
+      if (deletedAdmin) {
+        return res.status(200).json({
+          success: true,
+          message: "Shop Admin deleted successfully.",
+          deletedAdmin: {
+            id: deletedAdmin._id,
+            name: deletedAdmin.name,
+            email: deletedAdmin.email,
+            role: deletedAdmin.role,
+            licenseId: deletedAdmin.licenseId,
+          },
+        });
+      }
     }
 
-    return res.status(200).json({
-      success: true,
-      message: "Shop Admin deleted successfully.",
+    // 4. User not found in any ready tenant DB
+    return res.status(404).json({
+      success: false,
+      message: "Shop Admin not found in any ready tenant database.",
     });
   } catch (error) {
     console.error("Delete Shop Admin error:", error);

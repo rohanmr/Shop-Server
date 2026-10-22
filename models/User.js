@@ -1,8 +1,13 @@
-// backend/models/User.js
 const mongoose = require("mongoose");
+
 const UserSchema = new mongoose.Schema(
   {
-    name: { type: String, required: true },
+    name: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+
     email: {
       type: String,
       required: true,
@@ -26,14 +31,33 @@ const UserSchema = new mongoose.Schema(
       type: String,
       default: "",
     },
-    password: { type: String, required: true },
-    role: { type: String, enum: ["super_admin", "shop_admin"], required: true },
+
+    password: {
+      type: String,
+      required: true,
+    },
+
+    role: {
+      type: String,
+      enum: ["super_admin", "shop_admin"],
+      required: true,
+    },
+
     licenseId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "License",
       default: null,
     },
   },
-  { timestamps: true },
+  {
+    timestamps: true,
+  },
 );
-module.exports = mongoose.model("User", UserSchema);
+
+// Existing controllers continue using the master DB model.
+const User = mongoose.models.User || mongoose.model("User", UserSchema);
+
+// Tenant connections can compile the same schema separately.
+User.UserSchema = UserSchema;
+
+module.exports = User;
