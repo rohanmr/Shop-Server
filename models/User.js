@@ -48,6 +48,12 @@ const UserSchema = new mongoose.Schema(
       ref: "License",
       default: null,
     },
+    systemLicenseCode: {
+      type: String,
+      trim: true,
+      uppercase: true,
+      default: null,
+    },
   },
   {
     timestamps: true,

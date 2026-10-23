@@ -205,15 +205,14 @@ const createShopAdmin = async (req, res) => {
 };
 
 const createSuperAdmin = async (req, res) => {
-  const { name, email, password } = req.body;
+  const { name, email, password, mobile } = req.body;
 
-  if (!name?.trim() || !email?.trim() || !password) {
+  if (!name?.trim() || !email?.trim() || !password || !mobile?.trim()) {
     return res.status(400).json({
       success: false,
-      message: "Name, email, and password are required.",
+      message: "Name, email, password, and mobile are required.",
     });
   }
-
   try {
     const normalizedEmail = email.trim().toLowerCase();
 
@@ -232,15 +231,27 @@ const createSuperAdmin = async (req, res) => {
     // Hash password
     const hashedPassword = await bcrypt.hash(password, 12);
 
+    const systemLicenseCode =
+      process.env.SUPER_ADMIN_LICENSE_CODE?.trim().toUpperCase();
+
+    if (!systemLicenseCode) {
+      return res.status(500).json({
+        success: false,
+        message: "Super Admin license code is not configured.",
+      });
+    }
+
     // Create another Super Admin
     const newSuperAdmin = await User.create({
       name: name.trim(),
       email: normalizedEmail,
       password: hashedPassword,
+      mobile: mobile.trim(),
       role: "super_admin",
       licenseId: null,
+      systemLicenseCode,
     });
-
+    
     return res.status(201).json({
       success: true,
       message: "Super Admin created successfully.",

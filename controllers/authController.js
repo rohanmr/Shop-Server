@@ -78,6 +78,33 @@ const validateLicense = (license) => {
 };
 
 const findLoginUser = async ({ email, licenseCode }) => {
+  const systemLicenseCode = normalizeLicenseCode(
+    process.env.SUPER_ADMIN_LICENSE_CODE,
+  );
+
+  if (!systemLicenseCode) {
+    return {
+      error: {
+        status: 500,
+        message:
+          "Super Admin license code is not configured. Please configure SUPER_ADMIN_LICENSE_CODE.",
+      },
+    };
+  }
+
+  if (licenseCode === systemLicenseCode && systemLicenseCode) {
+    const user = await MasterUser.findOne({
+      email,
+      role: "super_admin",
+      systemLicenseCode,
+    });
+
+    if (!user) {
+      return { invalidCredentials: true };
+    }
+
+    return { user };
+  }
   // Shop Admin login must include the license code.
   if (licenseCode) {
     const license = await License.findOne({ code: licenseCode });
@@ -129,7 +156,18 @@ const findLoginUser = async ({ email, licenseCode }) => {
 exports.initiateLogin = async (req, res) => {
   const email = normalizeEmail(req.body.email);
   const password = req.body.password;
-  const licenseCode = normalizeLicenseCode(req.body.licenseCode);
+
+  const rawLicenseCode =
+    typeof req.body.licenseCode === "string" ? req.body.licenseCode.trim() : "";
+
+  if (rawLicenseCode && rawLicenseCode !== rawLicenseCode.toUpperCase()) {
+    return res.status(400).json({
+      success: false,
+      message: "License code must be entered in UPPERCASE letters.",
+    });
+  }
+
+  const licenseCode = normalizeLicenseCode(rawLicenseCode);
 
   if (!email || typeof password !== "string" || !password) {
     return res.status(400).json({
@@ -142,6 +180,13 @@ exports.initiateLogin = async (req, res) => {
     return res.status(400).json({
       success: false,
       message: "Provide a valid email address.",
+    });
+  }
+
+  if (!licenseCode) {
+    return res.status(400).json({
+      success: false,
+      message: "Please enter the Super Admin license code.",
     });
   }
 
